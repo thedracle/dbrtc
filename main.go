@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -126,6 +127,9 @@ func main() {
 			return
 		}
 
+		// Create a context that we can cancel to stop ffmpeg
+		ctx, cancelFFmpeg := context.WithCancel(context.Background())
+
 		// Add connection state callback
 		peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 			log.Printf("[PeerConnection] State changed to %s\n", state.String())
@@ -134,6 +138,11 @@ func main() {
 				state == webrtc.PeerConnectionStateFailed ||
 				state == webrtc.PeerConnectionStateDisconnected {
 				log.Println("[PeerConnection] Cleaning up connection")
+
+				// Cancel the ffmpeg context to terminate the process
+				cancelFFmpeg()
+				log.Println("[PeerConnection] Terminated associated ffmpeg process")
+
 				if err := peerConnection.Close(); err != nil {
 					log.Println("[PeerConnection] Error closing connection:", err)
 				}
@@ -188,7 +197,7 @@ func main() {
 		// Get a unique port for this connection
 		port := getNextPort()
 		log.Printf("[/offer] Starting ffmpeg and RTP relay on port %d\n", port)
-		go startFFmpeg(videoTrack, port)
+		go startFFmpeg(ctx, videoTrack, port)
 
 		<-webrtc.GatheringCompletePromise(peerConnection)
 
@@ -200,11 +209,11 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func startFFmpeg(videoTrack *webrtc.TrackLocalStaticRTP, port int) {
+func startFFmpeg(ctx context.Context, videoTrack *webrtc.TrackLocalStaticRTP, port int) {
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("[ffmpeg:%d] Starting ffmpeg with RTP output to %s", port, addr)
 
-	cmd := exec.Command("ffmpeg",
+	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-re", "-stream_loop", "-1", "-i", "test.mp4",
 		"-an", "-c:v", "libx264", "-f", "rtp", fmt.Sprintf("rtp://127.0.0.1:%d", port),
 	)
@@ -222,6 +231,16 @@ func startFFmpeg(videoTrack *webrtc.TrackLocalStaticRTP, port int) {
 		return
 	}
 
+	// Clean up the ffmpeg process when this function returns
+	defer func() {
+		if cmd.Process != nil {
+			log.Printf("[ffmpeg:%d] Stopping ffmpeg process", port)
+			if err := cmd.Process.Kill(); err != nil {
+				log.Printf("[ffmpeg:%d] Error killing process: %v", port, err)
+			}
+		}
+	}()
+
 	conn, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		log.Printf("[ffmpeg:%d] Failed to listen for RTP: %v", port, err)
@@ -231,11 +250,26 @@ func startFFmpeg(videoTrack *webrtc.TrackLocalStaticRTP, port int) {
 
 	log.Printf("[ffmpeg:%d] Listening for RTP packets on %s", port, addr)
 
+	// Create a channel that is closed when the context is done
+	done := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		log.Printf("[ffmpeg:%d] Context cancelled, closing UDP connection", port)
+		conn.Close()
+		close(done)
+	}()
+
 	buf := make([]byte, 1500)
 	for {
+		// Set a read deadline if needed
 		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
-			log.Printf("[ffmpeg:%d] RTP read error: %v", port, err)
+			select {
+			case <-done:
+				log.Printf("[ffmpeg:%d] Graceful shutdown of RTP reader", port)
+			default:
+				log.Printf("[ffmpeg:%d] RTP read error: %v", port, err)
+			}
 			break
 		}
 

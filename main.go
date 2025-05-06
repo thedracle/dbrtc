@@ -176,6 +176,9 @@ func main() {
 			return
 		}
 
+		// Print the answer
+		log.Println("[/offer] Answer:", answer.SDP)
+
 		if err := peerConnection.SetLocalDescription(answer); err != nil {
 			log.Println("[/offer] Error setting local description:", err)
 			http.Error(w, "failed to set local description", http.StatusInternalServerError)
